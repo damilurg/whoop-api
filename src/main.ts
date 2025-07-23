@@ -1,440 +1,649 @@
 #!/usr/bin/env node
 
+import { program } from 'commander';
 import inquirer from 'inquirer';
-import { logger, LogLevel } from './utils/logger.js';
-import { config, ensureDirectories } from './config/index.js';
-import { WhoopAuthAgent } from './agents/auth/whoopAuthAgent.js';
-import { DataFetchAgent } from './agents/api/dataFetchAgent.js';
-import { DataNormalizationAgent } from './agents/data/normalizationAgent.js';
-import { ChartRenderAgent } from './agents/charts/chartRenderAgent.js';
-import { ReportAgent } from './agents/report/reportAgent.js';
+import { WhoopAuthAgent } from './agents/auth/whoopAuthAgent';
+import { DataFetchAgent } from './agents/api/dataFetchAgent';
+import { NormalizationAgent } from './agents/data/normalizationAgent';
+import { ChartRenderAgent } from './agents/charts/chartRenderAgent';
+import { ReportAgent } from './agents/report/reportAgent';
+import { BLEAgent } from './agents/ble/bleAgent';
+import { WhoopDashboardServer } from './web/server';
+import { Logger } from './utils/logger';
+import { config } from './config';
+import { WhoopTokens, MonthlyStats } from './models/whoop';
+import path from 'path';
+import { promises as fs } from 'fs';
 
-interface CLIOptions {
-  skipAuth?: boolean;
-  skipFetch?: boolean;
-  skipNormalize?: boolean;
-  skipCharts?: boolean;
-  skipReport?: boolean;
-  verbose?: boolean;
-  manual?: boolean;
-  forceRefresh?: boolean;
-}
+const logger = new Logger('Main');
 
-export class WhoopAnalyticsMain {
+class WhoopAnalyticsSystem {
   private authAgent: WhoopAuthAgent;
-  private fetchAgent: DataFetchAgent;
-  private normalizationAgent: DataNormalizationAgent;
+  private dataAgent: DataFetchAgent;
+  private normAgent: NormalizationAgent;
   private chartAgent: ChartRenderAgent;
   private reportAgent: ReportAgent;
+  private bleAgent: BLEAgent;
+  private dashboardServer?: WhoopDashboardServer;
 
   constructor() {
     this.authAgent = new WhoopAuthAgent();
-    this.fetchAgent = new DataFetchAgent();
-    this.normalizationAgent = new DataNormalizationAgent();
+    this.dataAgent = new DataFetchAgent();
+    this.normAgent = new NormalizationAgent();
     this.chartAgent = new ChartRenderAgent();
     this.reportAgent = new ReportAgent();
+    this.bleAgent = new BLEAgent();
   }
 
   /**
-   * Parse command line arguments
+   * Initialize the system and ensure dependencies
    */
-  private parseArgs(): CLIOptions {
-    const args = process.argv.slice(2);
+  async initialize(): Promise<void> {
+    logger.info('🚀 Initializing WHOOP Analytics System...');
     
-    return {
-      skipAuth: args.includes('--skip-auth'),
-      skipFetch: args.includes('--skip-fetch'),
-      skipNormalize: args.includes('--skip-normalize'),
-      skipCharts: args.includes('--skip-charts'),
-      skipReport: args.includes('--skip-report'),
-      verbose: args.includes('--verbose') || args.includes('-v'),
-      manual: args.includes('--manual'),
-      forceRefresh: args.includes('--force'),
-    };
+    // Ensure directories exist
+    await this.ensureDirectories();
+    
+    // Check system requirements
+    await this.checkSystemRequirements();
+    
+    logger.success('✅ System initialized successfully');
   }
 
   /**
-   * Display welcome message and system info
+   * Ensure all required directories exist
    */
-  private displayWelcome(): void {
-    console.log(`
-╔══════════════════════════════════════════════════════════════╗
-║                    🏃‍♂️ WHOOP Analytics Agents                   ║
-║                                                              ║
-║  Comprehensive WHOOP data analysis with intelligent agents  ║
-║  📊 Charts | 📈 Analytics | 📋 Reports | 🔍 Insights        ║
-╚══════════════════════════════════════════════════════════════╝
-`);
+  private async ensureDirectories(): Promise<void> {
+    const dirs = [
+      config.dataDir,
+      config.reportsDir,
+      config.chartsDir,
+      path.join(config.dataDir, 'cache'),
+      path.join(config.dataDir, 'exports'),
+      path.join(config.dataDir, 'ble_sessions'),
+    ];
 
-    logger.info(`Configuration:
-  📂 Data Directory: ${config.storage.dataDir}
-  📊 Charts Directory: ${config.storage.chartOutputDir}
-  🔧 Config Directory: ${config.storage.configDir}
-`);
-  }
-
-  /**
-   * Check system prerequisites
-   */
-  private async checkPrerequisites(): Promise<boolean> {
-    logger.info('🔍 Checking system prerequisites...');
-
-    try {
-      // Check if environment variables are set
-      if (!config.whoop.clientId || !config.whoop.clientSecret) {
-        logger.error('❌ WHOOP API credentials not configured');
-        logger.info('Please set WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET in your .env file');
-        return false;
+    for (const dir of dirs) {
+      try {
+        await fs.mkdir(dir, { recursive: true });
+      } catch (error) {
+        logger.warn(`Failed to create directory ${dir}:`, error);
       }
-
-      // Ensure directories exist
-      ensureDirectories();
-
-      logger.success('✅ System prerequisites check passed');
-      return true;
-
-    } catch (error: any) {
-      logger.error(`❌ Prerequisites check failed: ${error.message}`);
-      return false;
     }
   }
 
   /**
-   * Interactive mode for user selections
+   * Check system requirements and capabilities
    */
-  private async interactiveMode(): Promise<CLIOptions> {
-    console.log('\\n🤖 Interactive Agent Execution Mode\\n');
+  private async checkSystemRequirements(): Promise<void> {
+    const status = {
+      node_version: process.version,
+      platform: process.platform,
+      ble_support: this.bleAgent.isSupported(),
+      ble_state: this.bleAgent.getState(),
+      memory: process.memoryUsage(),
+    };
 
-    const { operations } = await inquirer.prompt([
-      {
-        type: 'checkbox',
-        name: 'operations',
-        message: 'Select operations to run:',
-        choices: [
-          { name: '🔐 Authentication (WHOOP API)', value: 'auth', checked: true },
-          { name: '📥 Data Fetch (API calls)', value: 'fetch', checked: true },
-          { name: '🔄 Data Normalization', value: 'normalize', checked: true },
-          { name: '📊 Chart Generation', value: 'charts', checked: true },
-          { name: '📋 Report Generation', value: 'report', checked: true },
-        ],
-        validate: (answer) => {
-          if (answer.length < 1) {
-            return 'You must choose at least one operation.';
+    logger.info('System Status:', status);
+  }
+
+  /**
+   * Interactive CLI mode
+   */
+  async runInteractive(): Promise<void> {
+    logger.info('🎮 Starting interactive mode...');
+
+    try {
+      // Main menu
+      const { action } = await inquirer.prompt([
+        {
+          type: 'list',
+          name: 'action',
+          message: 'What would you like to do?',
+          choices: [
+            { name: '🚀 Launch Web Dashboard', value: 'dashboard' },
+            { name: '🔐 Authenticate with WHOOP', value: 'auth' },
+            { name: '📊 Generate Analytics Report', value: 'report' },
+            { name: '📱 BLE Device Management', value: 'ble' },
+            { name: '📈 Generate Charts Only', value: 'charts' },
+            { name: '🔄 Sync Latest Data', value: 'sync' },
+            { name: '⚙️ System Status', value: 'status' },
+            { name: '🚪 Exit', value: 'exit' }
+          ]
+        }
+      ]);
+
+      switch (action) {
+        case 'dashboard':
+          await this.launchDashboard();
+          break;
+        case 'auth':
+          await this.handleAuthentication();
+          break;
+        case 'report':
+          await this.generateReport();
+          break;
+        case 'ble':
+          await this.handleBLE();
+          break;
+        case 'charts':
+          await this.generateCharts();
+          break;
+        case 'sync':
+          await this.syncLatestData();
+          break;
+        case 'status':
+          await this.showSystemStatus();
+          break;
+        case 'exit':
+          logger.info('👋 Goodbye!');
+          process.exit(0);
+          break;
+      }
+    } catch (error) {
+      logger.error('Interactive mode error:', error);
+    }
+  }
+
+  /**
+   * Launch web dashboard
+   */
+  async launchDashboard(): Promise<void> {
+    logger.info('🌐 Launching web dashboard...');
+
+    try {
+      this.dashboardServer = new WhoopDashboardServer();
+      const port = parseInt(process.env.WEB_PORT || '3001');
+      
+      this.dashboardServer.start(port);
+      
+      logger.success(`🚀 Dashboard started at http://localhost:${port}`);
+      logger.info('Press Ctrl+C to stop the server');
+      
+      // Keep the process alive
+      await new Promise((resolve) => {
+        process.on('SIGINT', () => {
+          logger.info('Shutting down dashboard...');
+          resolve(void 0);
+        });
+      });
+    } catch (error) {
+      logger.error('Failed to launch dashboard:', error);
+    }
+  }
+
+  /**
+   * Handle authentication flow
+   */
+  async handleAuthentication(): Promise<void> {
+    logger.info('🔐 Starting authentication...');
+
+    try {
+      const tokens = await this.authAgent.authenticate();
+      
+      // Test connection
+      const success = await this.authAgent.testConnection(tokens);
+      if (success) {
+        logger.success('✅ Authentication successful!');
+        
+        // Get user info
+        const user = await this.authAgent.getUserProfile(tokens);
+        const measurements = await this.authAgent.getBodyMeasurements(tokens);
+        
+        logger.info(`👤 Authenticated as: ${user.first_name} ${user.last_name}`);
+        logger.info(`📏 Height: ${measurements.height_meter}m, Weight: ${measurements.weight_kilogram}kg`);
+      }
+    } catch (error) {
+      logger.error('Authentication failed:', error);
+    }
+  }
+
+  /**
+   * Generate comprehensive analytics report
+   */
+  async generateReport(): Promise<void> {
+    logger.info('📊 Generating analytics report...');
+
+    try {
+      // Get date range
+      const { timeframe } = await inquirer.prompt([
+        {
+          type: 'list',
+          name: 'timeframe',
+          message: 'Select timeframe for the report:',
+          choices: [
+            { name: 'Last 7 days', value: '7d' },
+            { name: 'Last 30 days', value: '30d' },
+            { name: 'Last 3 months', value: '3m' },
+            { name: 'Custom range', value: 'custom' }
+          ]
+        }
+      ]);
+
+      let startDate: string, endDate: string;
+      
+      if (timeframe === 'custom') {
+        const { start, end } = await inquirer.prompt([
+          {
+            type: 'input',
+            name: 'start',
+            message: 'Start date (YYYY-MM-DD):',
+            validate: (input: string) => {
+              return new Date(input).toString() !== 'Invalid Date' || 'Please enter a valid date';
+            }
+          },
+          {
+            type: 'input',
+            name: 'end',
+            message: 'End date (YYYY-MM-DD):',
+            validate: (input: string) => {
+              return new Date(input).toString() !== 'Invalid Date' || 'Please enter a valid date';
+            }
           }
-          return true;
-        },
-      },
-    ]);
+        ]);
+        startDate = start;
+        endDate = end;
+      } else {
+        endDate = new Date().toISOString();
+        const days = timeframe === '7d' ? 7 : timeframe === '30d' ? 30 : 90;
+        startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+      }
 
-    const { authMode } = await inquirer.prompt([
+      // Authenticate
+      const tokens = await this.authAgent.authenticate();
+      
+      // Fetch data
+      logger.info('📥 Fetching WHOOP data...');
+      const rawData = await this.dataAgent.fetchDateRangeData(tokens, startDate, endDate);
+      
+      // Normalize data
+      logger.info('🔄 Processing data...');
+      const normalizedData = await this.normAgent.normalizeMonthlyData(rawData);
+      
+      // Generate charts
+      logger.info('📊 Creating visualizations...');
+      const chartPaths = await this.chartAgent.generateReportCharts(normalizedData, {
+        dateRange: { start: startDate, end: endDate },
+        metrics: ['recovery', 'sleep', 'strain', 'hrv'],
+        includeNaps: true,
+        includeBLE: false,
+        smoothing: 'light',
+        aggregation: 'daily'
+      });
+      
+      // Generate report
+      logger.info('📄 Generating report...');
+      const report = await this.reportAgent.generateReport(
+        normalizedData,
+        chartPaths,
+        {
+          format: 'pdf',
+          includeCharts: true,
+          includeRawData: false,
+          includeBLEData: false,
+          dateRange: { start: startDate, end: endDate }
+        }
+      );
+      
+      logger.success(`✅ Report generated: ${report.filepath}`);
+      logger.info(`📁 Report saved as: ${path.basename(report.filepath)}`);
+      
+    } catch (error) {
+      logger.error('Report generation failed:', error);
+    }
+  }
+
+  /**
+   * Handle BLE device management
+   */
+  async handleBLE(): Promise<void> {
+    if (!this.bleAgent.isSupported()) {
+      logger.warn('⚠️ BLE is not supported on this system');
+      return;
+    }
+
+    const { bleAction } = await inquirer.prompt([
       {
         type: 'list',
-        name: 'authMode',
-        message: 'Authentication mode:',
+        name: 'bleAction',
+        message: 'BLE Device Management:',
         choices: [
-          { name: 'Automatic (local server)', value: 'auto' },
-          { name: 'Manual (copy authorization code)', value: 'manual' },
-        ],
-        when: () => operations.includes('auth'),
-      },
-    ]);
-
-    const { forceRefresh } = await inquirer.prompt([
-      {
-        type: 'confirm',
-        name: 'forceRefresh',
-        message: 'Force refresh data even if cache is valid?',
-        default: false,
-        when: () => operations.includes('fetch'),
-      },
-    ]);
-
-    return {
-      skipAuth: !operations.includes('auth'),
-      skipFetch: !operations.includes('fetch'),
-      skipNormalize: !operations.includes('normalize'),
-      skipCharts: !operations.includes('charts'),
-      skipReport: !operations.includes('report'),
-      manual: authMode === 'manual',
-      forceRefresh: forceRefresh || false,
-    };
-  }
-
-  /**
-   * Run authentication agent
-   */
-  private async runAuthAgent(options: CLIOptions): Promise<boolean> {
-    if (options.skipAuth) {
-      logger.info('⏭️ Skipping authentication step');
-      return true;
-    }
-
-    try {
-      logger.agent('MAIN', '🔐 Starting Authentication Agent...');
-      await this.authAgent.authenticate(options.manual);
-      logger.success('✅ Authentication completed');
-      return true;
-
-    } catch (error: any) {
-      logger.error(`❌ Authentication failed: ${error.message}`);
-      return false;
-    }
-  }
-
-  /**
-   * Run data fetch agent
-   */
-  private async runDataFetchAgent(options: CLIOptions): Promise<boolean> {
-    if (options.skipFetch) {
-      logger.info('⏭️ Skipping data fetch step');
-      return true;
-    }
-
-    try {
-      logger.agent('MAIN', '📥 Starting Data Fetch Agent...');
-
-      // Check cache unless force refresh
-      if (!options.forceRefresh && this.fetchAgent.isCacheValid()) {
-        logger.info('💾 Using cached data (use --force to refresh)');
-        return true;
+          { name: '🔍 Scan for WHOOP devices', value: 'scan' },
+          { name: '🔗 Connect to device', value: 'connect' },
+          { name: '📊 Start data session', value: 'session' },
+          { name: '📋 View device status', value: 'status' },
+          { name: '📁 List saved sessions', value: 'sessions' },
+          { name: '🔙 Back to main menu', value: 'back' }
+        ]
       }
-
-      await this.fetchAgent.fetchAllData();
-      logger.success('✅ Data fetch completed');
-      return true;
-
-    } catch (error: any) {
-      logger.error(`❌ Data fetch failed: ${error.message}`);
-      return false;
-    }
-  }
-
-  /**
-   * Run data normalization agent
-   */
-  private async runNormalizationAgent(options: CLIOptions): Promise<boolean> {
-    if (options.skipNormalize) {
-      logger.info('⏭️ Skipping data normalization step');
-      return true;
-    }
+    ]);
 
     try {
-      logger.agent('MAIN', '🔄 Starting Data Normalization Agent...');
-      await this.normalizationAgent.normalizeAllData();
-      logger.success('✅ Data normalization completed');
-      return true;
-
-    } catch (error: any) {
-      logger.error(`❌ Data normalization failed: ${error.message}`);
-      return false;
+      switch (bleAction) {
+        case 'scan':
+          await this.scanBLEDevices();
+          break;
+        case 'connect':
+          await this.connectBLEDevice();
+          break;
+        case 'session':
+          await this.startBLESession();
+          break;
+        case 'status':
+          await this.showBLEStatus();
+          break;
+        case 'sessions':
+          await this.listBLESessions();
+          break;
+        case 'back':
+          await this.runInteractive();
+          break;
+      }
+    } catch (error) {
+      logger.error('BLE operation failed:', error);
     }
   }
 
   /**
-   * Run chart rendering agent
+   * Scan for BLE devices
    */
-  private async runChartAgent(options: CLIOptions): Promise<boolean> {
-    if (options.skipCharts) {
-      logger.info('⏭️ Skipping chart generation step');
-      return true;
-    }
-
-    try {
-      logger.agent('MAIN', '📊 Starting Chart Rendering Agent...');
-      await this.chartAgent.generateAllCharts();
-      logger.success('✅ Chart generation completed');
-      return true;
-
-    } catch (error: any) {
-      logger.error(`❌ Chart generation failed: ${error.message}`);
-      return false;
-    }
-  }
-
-  /**
-   * Run report generation agent
-   */
-  private async runReportAgent(options: CLIOptions): Promise<boolean> {
-    if (options.skipReport) {
-      logger.info('⏭️ Skipping report generation step');
-      return true;
-    }
-
-    try {
-      logger.agent('MAIN', '📋 Starting Report Generation Agent...');
-      const result = await this.reportAgent.generateCompleteReport();
-      
-      logger.success('✅ Report generation completed');
-      logger.info(`📄 Reports generated:
-        - HTML: ${result.html}
-        - PDF: ${result.pdf}`);
-      
-      return true;
-
-    } catch (error: any) {
-      logger.error(`❌ Report generation failed: ${error.message}`);
-      return false;
-    }
-  }
-
-  /**
-   * Display execution summary
-   */
-  private displaySummary(success: boolean, startTime: number): void {
-    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+  private async scanBLEDevices(): Promise<void> {
+    logger.info('🔍 Scanning for WHOOP devices...');
     
-    console.log(`\\n${'='.repeat(60)}`);
+    const devices = await this.bleAgent.startScanning(30000);
     
-    if (success) {
-      console.log(`🎉 WHOOP Analytics Pipeline Completed Successfully!`);
-      console.log(`⏱️  Total execution time: ${duration} seconds`);
-      console.log(`\\n📊 Generated outputs:`);
-      console.log(`   - Normalized data: ${config.storage.dataDir}/normalized_data.json`);
-      console.log(`   - Charts: ${config.storage.chartOutputDir}/`);
-      console.log(`   - HTML Report: ${config.storage.chartOutputDir}/monthly_report.html`);
-      console.log(`   - PDF Report: ${config.storage.chartOutputDir}/monthly_report.pdf`);
+    if (devices.length === 0) {
+      logger.warn('No WHOOP devices found');
     } else {
-      console.log(`❌ WHOOP Analytics Pipeline Failed`);
-      console.log(`⏱️  Execution time: ${duration} seconds`);
-      console.log(`\\n🔍 Check the logs above for error details`);
+      logger.success(`Found ${devices.length} device(s):`);
+      devices.forEach(device => {
+        logger.info(`📱 ${device.name} (${device.id}) - RSSI: ${device.rssi}dBm`);
+      });
     }
-    
-    console.log(`\\n📚 Need help? Check the README.md file`);
-    console.log(`${'='.repeat(60)}\\n`);
   }
 
   /**
-   * Main execution pipeline
+   * Connect to BLE device
    */
-  async run(): Promise<void> {
-    const startTime = Date.now();
-    let success = false;
+  private async connectBLEDevice(): Promise<void> {
+    // Implementation would allow device selection and connection
+    logger.info('🔗 BLE connection feature coming soon...');
+  }
+
+  /**
+   * Start BLE data session
+   */
+  private async startBLESession(): Promise<void> {
+    // Implementation would start a data collection session
+    logger.info('📊 BLE session feature coming soon...');
+  }
+
+  /**
+   * Show BLE status
+   */
+  private async showBLEStatus(): Promise<void> {
+    const status = this.bleAgent.getStatus();
+    logger.info('📱 BLE Status:', status);
+  }
+
+  /**
+   * List BLE sessions
+   */
+  private async listBLESessions(): Promise<void> {
+    const sessions = await this.bleAgent.listSessions();
+    if (sessions.length === 0) {
+      logger.info('No saved BLE sessions found');
+    } else {
+      logger.info(`Found ${sessions.length} saved session(s):`);
+      sessions.forEach(session => {
+        logger.info(`📁 ${session}`);
+      });
+    }
+  }
+
+  /**
+   * Generate charts only
+   */
+  async generateCharts(): Promise<void> {
+    logger.info('📈 Generating charts...');
 
     try {
-      this.displayWelcome();
-
-      // Parse command line options
-      const cliOptions = this.parseArgs();
+      const tokens = await this.authAgent.authenticate();
+      const data = await this.dataAgent.fetchLatestData(tokens);
+      const normalizedData = await this.normAgent.normalizeMonthlyData(data);
       
-      // Set verbose logging if requested
-      if (cliOptions.verbose) {
-        logger.setLevel(LogLevel.DEBUG);
-      }
-
-      // Check prerequisites
-      if (!(await this.checkPrerequisites())) {
-        process.exit(1);
-      }
-
-      // Determine execution options
-      let options: CLIOptions;
+      const chartPaths = await this.chartAgent.generateReportCharts(normalizedData, {
+        dateRange: { start: '', end: '' },
+        metrics: ['recovery', 'sleep', 'strain'],
+        includeNaps: true,
+        includeBLE: false,
+        smoothing: 'none',
+        aggregation: 'daily'
+      });
       
-      if (process.argv.length === 2) {
-        // No arguments provided, run interactive mode
-        options = await this.interactiveMode();
-      } else {
-        options = cliOptions;
+      logger.success(`✅ Generated ${chartPaths.length} charts`);
+      chartPaths.forEach(path => {
+        logger.info(`📊 ${path}`);
+      });
+      
+    } catch (error) {
+      logger.error('Chart generation failed:', error);
+    }
+  }
+
+  /**
+   * Sync latest data
+   */
+  async syncLatestData(): Promise<void> {
+    logger.info('🔄 Syncing latest data...');
+
+    try {
+      const tokens = await this.authAgent.authenticate();
+      const data = await this.dataAgent.fetchLatestData(tokens);
+      
+      logger.success('✅ Data synchronized');
+      logger.info(`📊 Summary: ${data.cycles.length} cycles, ${data.sleep.length} sleep records, ${data.workouts.length} workouts`);
+      
+    } catch (error) {
+      logger.error('Data sync failed:', error);
+    }
+  }
+
+  /**
+   * Show system status
+   */
+  async showSystemStatus(): Promise<void> {
+    logger.info('⚙️ System Status:');
+
+    try {
+      const authStatus = await this.authAgent.getAuthStatus();
+      const bleStatus = this.bleAgent.getStatus();
+      
+      const status = {
+        authentication: authStatus.authenticated,
+        user: authStatus.user?.first_name + ' ' + authStatus.user?.last_name,
+        ble_support: bleStatus.supported,
+        ble_state: bleStatus.state,
+        connected_devices: bleStatus.connected_devices,
+        active_session: bleStatus.active_session,
+        system: {
+          node_version: process.version,
+          platform: process.platform,
+          memory_usage: process.memoryUsage(),
+          uptime: process.uptime()
+        }
+      };
+
+      console.table(status);
+      
+    } catch (error) {
+      logger.error('Failed to get system status:', error);
+    }
+  }
+
+  /**
+   * Run automated pipeline
+   */
+  async runAutomated(options: {
+    timeframe?: string;
+    format?: string;
+    includeBLE?: boolean;
+    skipAuth?: boolean;
+  } = {}): Promise<void> {
+    logger.info('🤖 Running automated pipeline...');
+
+    try {
+      const {
+        timeframe = '30d',
+        format = 'pdf',
+        includeBLE = false,
+        skipAuth = false
+      } = options;
+
+      // Authentication
+      if (!skipAuth) {
+        logger.info('🔐 Authenticating...');
+        await this.authAgent.authenticate();
       }
 
-      logger.info('🚀 Starting WHOOP Analytics Agent Pipeline...');
+      // Calculate date range
+      const endDate = new Date().toISOString();
+      const days = timeframe === '7d' ? 7 : timeframe === '30d' ? 30 : 90;
+      const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
-      // Execute agent pipeline
-      const authSuccess = await this.runAuthAgent(options);
-      if (!authSuccess) {
-        process.exit(1);
-      }
+      // Data pipeline
+      logger.info('📥 Fetching data...');
+      const tokens = await this.authAgent.authenticate();
+      const rawData = await this.dataAgent.fetchDateRangeData(tokens, startDate, endDate);
 
-      const fetchSuccess = await this.runDataFetchAgent(options);
-      if (!fetchSuccess) {
-        process.exit(1);
-      }
+      logger.info('🔄 Processing data...');
+      const normalizedData = await this.normAgent.normalizeMonthlyData(rawData);
 
-      const normalizeSuccess = await this.runNormalizationAgent(options);
-      if (!normalizeSuccess) {
-        process.exit(1);
-      }
+      logger.info('📊 Generating charts...');
+      const chartPaths = await this.chartAgent.generateReportCharts(normalizedData, {
+        dateRange: { start: startDate, end: endDate },
+        metrics: ['recovery', 'sleep', 'strain', 'hrv'],
+        includeNaps: true,
+        includeBLE,
+        smoothing: 'light',
+        aggregation: 'daily'
+      });
 
-      const chartSuccess = await this.runChartAgent(options);
-      if (!chartSuccess) {
-        process.exit(1);
-      }
+      logger.info('📄 Generating report...');
+      const report = await this.reportAgent.generateReport(
+        normalizedData,
+        chartPaths,
+        {
+          format: format as any,
+          includeCharts: true,
+          includeRawData: false,
+          includeBLEData: includeBLE,
+          dateRange: { start: startDate, end: endDate }
+        }
+      );
 
-      const reportSuccess = await this.runReportAgent(options);
-      if (!reportSuccess) {
-        process.exit(1);
-      }
+      logger.success('✅ Automated pipeline completed successfully!');
+      logger.info(`📁 Report: ${report.filepath}`);
+      logger.info(`📊 Charts: ${chartPaths.length} generated`);
+      logger.info(`📈 Data points: ${normalizedData.daily_stats.length} days`);
 
-      success = true;
-
-    } catch (error: any) {
-      logger.error(`❌ Pipeline execution failed: ${error.message}`);
-      if (cliOptions?.verbose) {
-        console.error(error.stack);
-      }
-    } finally {
-      this.displaySummary(success, startTime);
-      process.exit(success ? 0 : 1);
+    } catch (error) {
+      logger.error('Automated pipeline failed:', error);
+      throw error;
     }
   }
 }
 
-/**
- * Display help information
- */
-function displayHelp(): void {
-  console.log(`
-WHOOP Analytics Agents - Command Line Interface
+// CLI Setup
+program
+  .name('whoop-analytics')
+  .description('Advanced WHOOP Analytics System with BLE Integration')
+  .version('2.0.0');
 
-USAGE:
-  npm run dev                          Run in interactive mode
-  npm run dev -- [OPTIONS]            Run with specific options
-
-OPTIONS:
-  --skip-auth          Skip authentication step
-  --skip-fetch         Skip data fetching step  
-  --skip-normalize     Skip data normalization step
-  --skip-charts        Skip chart generation step
-  --skip-report        Skip report generation step
-  --manual             Use manual authentication flow
-  --force              Force refresh data even if cache is valid
-  --verbose, -v        Enable verbose logging
-  --help, -h           Show this help message
-
-EXAMPLES:
-  npm run dev                                    # Interactive mode
-  npm run dev -- --skip-auth --force           # Skip auth, force data refresh
-  npm run dev -- --manual --verbose            # Manual auth with verbose logging
-  npm run dev -- --skip-fetch --skip-normalize # Generate charts from existing data
-
-INDIVIDUAL AGENTS:
-  npm run auth         Run authentication agent only
-  npm run fetch        Run data fetch agent only  
-  npm run normalize    Run normalization agent only
-  npm run charts       Run chart generation agent only
-  npm run report       Run report generation agent only
-
-ENVIRONMENT SETUP:
-  Copy .env.example to .env and configure your WHOOP API credentials:
-  - WHOOP_CLIENT_ID
-  - WHOOP_CLIENT_SECRET
-  - WHOOP_REDIRECT_URI (optional)
-
-For more information, visit: https://developer.whoop.com/
-`);
-}
-
-// CLI execution
-if (import.meta.url === \`file://\${process.argv[1]}\`) {
-  const args = process.argv.slice(2);
-  
-  if (args.includes('--help') || args.includes('-h')) {
-    displayHelp();
-    process.exit(0);
-  }
-
-  const app = new WhoopAnalyticsMain();
-  app.run().catch((error) => {
-    logger.error(\`Fatal error: \${error.message}\`);
-    process.exit(1);
+program
+  .command('dashboard')
+  .description('Launch the web dashboard')
+  .option('-p, --port <port>', 'Dashboard port', '3001')
+  .action(async (options) => {
+    const system = new WhoopAnalyticsSystem();
+    await system.initialize();
+    process.env.WEB_PORT = options.port;
+    await system.launchDashboard();
   });
+
+program
+  .command('interactive')
+  .alias('i')
+  .description('Start interactive mode')
+  .action(async () => {
+    const system = new WhoopAnalyticsSystem();
+    await system.initialize();
+    await system.runInteractive();
+  });
+
+program
+  .command('auth')
+  .description('Authenticate with WHOOP API')
+  .action(async () => {
+    const system = new WhoopAnalyticsSystem();
+    await system.initialize();
+    await system.handleAuthentication();
+  });
+
+program
+  .command('report')
+  .description('Generate analytics report')
+  .option('-t, --timeframe <timeframe>', 'Timeframe (7d, 30d, 3m)', '30d')
+  .option('-f, --format <format>', 'Output format (pdf, html)', 'pdf')
+  .option('--ble', 'Include BLE data')
+  .option('--skip-auth', 'Skip authentication (use cached tokens)')
+  .action(async (options) => {
+    const system = new WhoopAnalyticsSystem();
+    await system.initialize();
+    await system.runAutomated({
+      timeframe: options.timeframe,
+      format: options.format,
+      includeBLE: options.ble,
+      skipAuth: options.skipAuth
+    });
+  });
+
+program
+  .command('ble')
+  .description('BLE device management')
+  .option('-s, --scan', 'Scan for devices')
+  .option('--status', 'Show BLE status')
+  .action(async (options) => {
+    const system = new WhoopAnalyticsSystem();
+    await system.initialize();
+    
+    if (options.scan) {
+      await system.scanBLEDevices();
+    } else if (options.status) {
+      await system.showBLEStatus();
+    } else {
+      await system.handleBLE();
+    }
+  });
+
+program
+  .command('status')
+  .description('Show system status')
+  .action(async () => {
+    const system = new WhoopAnalyticsSystem();
+    await system.initialize();
+    await system.showSystemStatus();
+  });
+
+// Default to interactive mode if no command specified
+if (process.argv.length === 2) {
+  (async () => {
+    const system = new WhoopAnalyticsSystem();
+    await system.initialize();
+    await system.runInteractive();
+  })();
+} else {
+  program.parse();
 }
+
+export { WhoopAnalyticsSystem };

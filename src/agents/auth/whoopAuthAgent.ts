@@ -1,94 +1,209 @@
-import axios from 'axios';
-import fs from 'fs';
-import { createServer } from 'http';
-import { URL } from 'url';
-import inquirer from 'inquirer';
-import { config, TOKEN_FILE_PATH, ensureDirectories } from '../../config/index.js';
-import { logger } from '../../utils/logger.js';
-import { WhoopTokens, WhoopError } from '../../models/whoop.js';
+import axios, { AxiosResponse } from 'axios';
+import { promises as fs } from 'fs';
+import { createServer, IncomingMessage, ServerResponse } from 'http';
+import { parse } from 'url';
+import { Agent } from '../base/agent';
+import { WhoopTokens, WhoopError, WhoopUser, BodyMeasurements } from '../../models/whoop';
+import { config } from '../../config';
+import { Logger } from '../../utils/logger';
+import * as readline from 'readline';
 
-export class WhoopAuthAgent {
-  private readonly clientId: string;
-  private readonly clientSecret: string;
-  private readonly redirectUri: string;
-  private readonly apiBaseUrl: string;
+export class WhoopAuthAgent extends Agent {
+  private readonly API_BASE_URL = 'https://api.prod.whoop.com';
+  private readonly REDIRECT_URI = 'http://localhost:3000/callback';
+  private readonly SCOPES = [
+    'read:profile',
+    'read:body_measurement', 
+    'read:cycles',
+    'read:recovery',
+    'read:sleep',
+    'read:workout'
+  ];
 
   constructor() {
-    this.clientId = config.whoop.clientId;
-    this.clientSecret = config.whoop.clientSecret;
-    this.redirectUri = config.whoop.redirectUri;
-    this.apiBaseUrl = config.whoop.apiBaseUrl;
+    super('WhoopAuth', new Logger('WhoopAuth'));
   }
 
   /**
-   * Generate OAuth2 authorization URL
+   * Main authentication flow - attempts to load existing tokens or start OAuth flow
    */
-  private generateAuthUrl(): string {
-    const params = new URLSearchParams({
-      response_type: 'code',
-      client_id: this.clientId,
-      redirect_uri: this.redirectUri,
-      scope: 'read:recovery read:sleep read:workout read:cycles read:body_measurement read:profile',
-      state: 'whoop-analytics-agent',
-    });
-
-    return `https://api.prod.whoop.com/oauth/oauth2/auth/?${params.toString()}`;
-  }
-
-  /**
-   * Exchange authorization code for tokens
-   */
-  private async exchangeCodeForTokens(code: string): Promise<WhoopTokens> {
-    logger.agent('AUTH', 'Exchanging authorization code for tokens...');
+  async authenticate(): Promise<WhoopTokens> {
+    this.logger.info('🔐 Starting WHOOP authentication process...');
 
     try {
-      const response = await axios.post(
-        'https://api.prod.whoop.com/oauth/oauth2/token/',
-        {
-          grant_type: 'authorization_code',
-          client_id: this.clientId,
-          client_secret: this.clientSecret,
-          code: code,
-          redirect_uri: this.redirectUri,
-        },
-        {
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-        }
-      );
-
-      const tokens: WhoopTokens = {
-        ...response.data,
-        expires_at: Date.now() + (response.data.expires_in * 1000),
-      };
-
-      logger.success('Tokens obtained successfully');
-      return tokens;
-    } catch (error: any) {
-      if (error.response?.data) {
-        const whoopError: WhoopError = error.response.data;
-        throw new Error(`WHOOP API Error: ${whoopError.error} - ${whoopError.error_description}`);
+      // Try to load existing valid tokens
+      const existingTokens = await this.loadTokens();
+      if (existingTokens && await this.validateTokens(existingTokens)) {
+        this.logger.success('✅ Using existing valid tokens');
+        return existingTokens;
       }
-      throw new Error(`Failed to exchange code for tokens: ${error.message}`);
+
+      // Try to refresh if we have refresh token
+      if (existingTokens?.refresh_token) {
+        this.logger.info('🔄 Attempting to refresh tokens...');
+        try {
+          const refreshedTokens = await this.refreshTokens(existingTokens.refresh_token);
+          await this.saveTokens(refreshedTokens);
+          this.logger.success('✅ Successfully refreshed tokens');
+          return refreshedTokens;
+        } catch (error) {
+          this.logger.warn('⚠️ Token refresh failed, starting new OAuth flow');
+        }
+      }
+
+      // Start new OAuth flow
+      this.logger.info('🌐 Starting OAuth 2.0 authorization flow...');
+      const newTokens = await this.startOAuthFlow();
+      await this.saveTokens(newTokens);
+      this.logger.success('✅ Successfully completed OAuth flow');
+      
+      return newTokens;
+    } catch (error) {
+      this.logger.error('❌ Authentication failed:', error);
+      throw error;
     }
   }
 
   /**
-   * Refresh access token using refresh token
+   * Start OAuth 2.0 authorization flow
    */
-  async refreshTokens(refreshToken: string): Promise<WhoopTokens> {
-    logger.agent('AUTH', 'Refreshing access token...');
+  private async startOAuthFlow(): Promise<WhoopTokens> {
+    const state = this.generateState();
+    const authUrl = this.buildAuthUrl(state);
+    
+    this.logger.info('📱 Please visit the following URL to authorize the application:');
+    this.logger.info(`🔗 ${authUrl}`);
+    
+    // Try to start local server first, fallback to manual input
+    try {
+      const authCode = await this.startLocalServer(state);
+      return await this.exchangeCodeForTokens(authCode);
+    } catch (serverError) {
+      this.logger.warn('⚠️ Local server failed, using manual code input');
+      return await this.manualCodeInput(state);
+    }
+  }
+
+  /**
+   * Build OAuth authorization URL
+   */
+  private buildAuthUrl(state: string): string {
+    const params = new URLSearchParams({
+      client_id: config.whoop.clientId,
+      redirect_uri: this.REDIRECT_URI,
+      response_type: 'code',
+      scope: this.SCOPES.join(' '),
+      state: state
+    });
+
+    return `${this.API_BASE_URL}/oauth/oauth2/auth?${params.toString()}`;
+  }
+
+  /**
+   * Start local HTTP server to capture OAuth callback
+   */
+  private async startLocalServer(expectedState: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+        if (req.url) {
+          const urlParts = parse(req.url, true);
+          
+          if (urlParts.pathname === '/callback') {
+            const { code, state, error } = urlParts.query;
+            
+            if (error) {
+              res.writeHead(400, { 'Content-Type': 'text/html' });
+              res.end(`<h1>Authorization Error</h1><p>${error}</p>`);
+              server.close();
+              reject(new Error(`OAuth error: ${error}`));
+              return;
+            }
+            
+            if (state !== expectedState) {
+              res.writeHead(400, { 'Content-Type': 'text/html' });
+              res.end('<h1>Invalid State</h1><p>State parameter mismatch</p>');
+              server.close();
+              reject(new Error('State parameter mismatch'));
+              return;
+            }
+            
+            if (code && typeof code === 'string') {
+              res.writeHead(200, { 'Content-Type': 'text/html' });
+              res.end(`
+                <h1>✅ Authorization Successful!</h1>
+                <p>You can close this window and return to your terminal.</p>
+                <script>window.close();</script>
+              `);
+              server.close();
+              resolve(code);
+            } else {
+              res.writeHead(400, { 'Content-Type': 'text/html' });
+              res.end('<h1>Missing Authorization Code</h1>');
+              server.close();
+              reject(new Error('No authorization code received'));
+            }
+          }
+        }
+      });
+
+      server.listen(3000, () => {
+        this.logger.info('🌐 Local server started on http://localhost:3000');
+        this.logger.info('⏳ Waiting for OAuth callback...');
+      });
+
+      server.on('error', (error) => {
+        reject(error);
+      });
+
+      // Timeout after 5 minutes
+      setTimeout(() => {
+        server.close();
+        reject(new Error('OAuth flow timeout - no callback received within 5 minutes'));
+      }, 5 * 60 * 1000);
+    });
+  }
+
+  /**
+   * Manual code input fallback
+   */
+  private async manualCodeInput(expectedState: string): Promise<WhoopTokens> {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+
+    return new Promise((resolve, reject) => {
+      rl.question('📝 Please enter the authorization code from the callback URL: ', async (code) => {
+        rl.close();
+        
+        try {
+          const tokens = await this.exchangeCodeForTokens(code.trim());
+          resolve(tokens);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+  }
+
+  /**
+   * Exchange authorization code for access tokens
+   */
+  private async exchangeCodeForTokens(code: string): Promise<WhoopTokens> {
+    this.logger.info('🔄 Exchanging authorization code for tokens...');
+    
+    const data = new URLSearchParams({
+      grant_type: 'authorization_code',
+      client_id: config.whoop.clientId,
+      client_secret: config.whoop.clientSecret,
+      redirect_uri: this.REDIRECT_URI,
+      code: code
+    });
 
     try {
-      const response = await axios.post(
-        'https://api.prod.whoop.com/oauth/oauth2/token/',
-        {
-          grant_type: 'refresh_token',
-          client_id: this.clientId,
-          client_secret: this.clientSecret,
-          refresh_token: refreshToken,
-        },
+      const response: AxiosResponse = await axios.post(
+        `${this.API_BASE_URL}/oauth/oauth2/token`,
+        data,
         {
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
@@ -98,17 +213,119 @@ export class WhoopAuthAgent {
 
       const tokens: WhoopTokens = {
         ...response.data,
-        expires_at: Date.now() + (response.data.expires_in * 1000),
+        expires_at: Date.now() + (response.data.expires_in * 1000)
       };
 
-      logger.success('Tokens refreshed successfully');
+      this.logger.success('✅ Successfully obtained access tokens');
       return tokens;
     } catch (error: any) {
-      if (error.response?.data) {
-        const whoopError: WhoopError = error.response.data;
-        throw new Error(`WHOOP API Error: ${whoopError.error} - ${whoopError.error_description}`);
-      }
-      throw new Error(`Failed to refresh tokens: ${error.message}`);
+      this.logger.error('❌ Failed to exchange code for tokens:', error.response?.data || error.message);
+      throw new Error(`Token exchange failed: ${error.response?.data?.error_description || error.message}`);
+    }
+  }
+
+  /**
+   * Refresh access tokens using refresh token
+   */
+  async refreshTokens(refreshToken: string): Promise<WhoopTokens> {
+    this.logger.info('🔄 Refreshing access tokens...');
+    
+    const data = new URLSearchParams({
+      grant_type: 'refresh_token',
+      client_id: config.whoop.clientId,
+      client_secret: config.whoop.clientSecret,
+      refresh_token: refreshToken
+    });
+
+    try {
+      const response: AxiosResponse = await axios.post(
+        `${this.API_BASE_URL}/oauth/oauth2/token`,
+        data,
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+        }
+      );
+
+      const tokens: WhoopTokens = {
+        ...response.data,
+        expires_at: Date.now() + (response.data.expires_in * 1000)
+      };
+
+      this.logger.success('✅ Successfully refreshed tokens');
+      return tokens;
+    } catch (error: any) {
+      this.logger.error('❌ Failed to refresh tokens:', error.response?.data || error.message);
+      throw new Error(`Token refresh failed: ${error.response?.data?.error_description || error.message}`);
+    }
+  }
+
+  /**
+   * Validate tokens by making a test API call
+   */
+  private async validateTokens(tokens: WhoopTokens): Promise<boolean> {
+    if (!tokens.access_token || Date.now() >= tokens.expires_at) {
+      return false;
+    }
+
+    try {
+      await axios.get(`${this.API_BASE_URL}/developer/v2/user/profile/basic`, {
+        headers: {
+          'Authorization': `Bearer ${tokens.access_token}`
+        }
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Get user profile information
+   */
+  async getUserProfile(tokens: WhoopTokens): Promise<WhoopUser> {
+    this.logger.info('👤 Fetching user profile...');
+    
+    try {
+      const response: AxiosResponse<WhoopUser> = await axios.get(
+        `${this.API_BASE_URL}/developer/v2/user/profile/basic`,
+        {
+          headers: {
+            'Authorization': `Bearer ${tokens.access_token}`
+          }
+        }
+      );
+
+      this.logger.success(`✅ Retrieved profile for ${response.data.first_name} ${response.data.last_name}`);
+      return response.data;
+    } catch (error: any) {
+      this.logger.error('❌ Failed to fetch user profile:', error.response?.data || error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Get user body measurements
+   */
+  async getBodyMeasurements(tokens: WhoopTokens): Promise<BodyMeasurements> {
+    this.logger.info('📏 Fetching body measurements...');
+    
+    try {
+      const response: AxiosResponse<BodyMeasurements> = await axios.get(
+        `${this.API_BASE_URL}/developer/v2/user/measurement/body`,
+        {
+          headers: {
+            'Authorization': `Bearer ${tokens.access_token}`
+          }
+        }
+      );
+
+      this.logger.success('✅ Retrieved body measurements');
+      return response.data;
+    } catch (error: any) {
+      this.logger.error('❌ Failed to fetch body measurements:', error.response?.data || error.message);
+      throw error;
     }
   }
 
@@ -116,183 +333,185 @@ export class WhoopAuthAgent {
    * Save tokens to file
    */
   private async saveTokens(tokens: WhoopTokens): Promise<void> {
-    ensureDirectories();
-    fs.writeFileSync(TOKEN_FILE_PATH, JSON.stringify(tokens, null, 2));
-    logger.success(`Tokens saved to ${TOKEN_FILE_PATH}`);
+    try {
+      await fs.writeFile(config.tokenFilePath, JSON.stringify(tokens, null, 2));
+      this.logger.info('💾 Tokens saved successfully');
+    } catch (error) {
+      this.logger.error('❌ Failed to save tokens:', error);
+      throw error;
+    }
   }
 
   /**
    * Load tokens from file
    */
-  loadTokens(): WhoopTokens | null {
+  private async loadTokens(): Promise<WhoopTokens | null> {
     try {
-      if (!fs.existsSync(TOKEN_FILE_PATH)) {
-        return null;
-      }
-      const tokens = JSON.parse(fs.readFileSync(TOKEN_FILE_PATH, 'utf8'));
-      return tokens as WhoopTokens;
+      const data = await fs.readFile(config.tokenFilePath, 'utf-8');
+      const tokens: WhoopTokens = JSON.parse(data);
+      this.logger.info('📁 Loaded existing tokens');
+      return tokens;
     } catch (error) {
-      logger.error('Failed to load tokens from file');
+      this.logger.info('📁 No existing tokens found');
       return null;
     }
   }
 
   /**
-   * Check if current tokens are valid
+   * Generate random state parameter for OAuth security
    */
-  isTokenValid(tokens: WhoopTokens): boolean {
-    const bufferTime = 5 * 60 * 1000; // 5 minutes buffer
-    return Date.now() < (tokens.expires_at - bufferTime);
+  private generateState(): string {
+    return Math.random().toString(36).substring(2, 15) + 
+           Math.random().toString(36).substring(2, 15);
   }
 
   /**
-   * Get valid access token (refresh if needed)
+   * Test API connectivity and authentication
    */
-  async getValidAccessToken(): Promise<string> {
-    const tokens = this.loadTokens();
+  async testConnection(tokens: WhoopTokens): Promise<boolean> {
+    this.logger.info('🔍 Testing API connection...');
     
-    if (!tokens) {
-      throw new Error('No tokens found. Please run authentication first.');
-    }
-
-    if (this.isTokenValid(tokens)) {
-      return tokens.access_token;
-    }
-
-    logger.agent('AUTH', 'Token expired, refreshing...');
-    const newTokens = await this.refreshTokens(tokens.refresh_token);
-    await this.saveTokens(newTokens);
-    return newTokens.access_token;
-  }
-
-  /**
-   * Start OAuth2 flow with local server
-   */
-  private async startAuthServer(): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const server = createServer((req, res) => {
-        const url = new URL(req.url || '', `http://localhost:3000`);
-        
-        if (url.pathname === '/callback') {
-          const code = url.searchParams.get('code');
-          const error = url.searchParams.get('error');
-
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          
-          if (error) {
-            res.end(`<h1>Error: ${error}</h1><p>Authorization failed. You can close this window.</p>`);
-            reject(new Error(`Authorization error: ${error}`));
-            return;
-          }
-
-          if (code) {
-            res.end('<h1>Success!</h1><p>Authorization successful. You can close this window.</p>');
-            server.close();
-            resolve(code);
-            return;
-          }
-
-          res.end('<h1>Error</h1><p>No authorization code received.</p>');
-          reject(new Error('No authorization code received'));
-        } else {
-          res.writeHead(404);
-          res.end('Not found');
-        }
-      });
-
-      server.listen(3000, () => {
-        logger.agent('AUTH', 'Authorization server started on http://localhost:3000');
-      });
-
-      server.on('error', (err) => {
-        reject(new Error(`Server error: ${err.message}`));
-      });
-    });
-  }
-
-  /**
-   * Manual authorization flow (for environments without local server)
-   */
-  private async manualAuthFlow(): Promise<string> {
-    const authUrl = this.generateAuthUrl();
-    
-    console.log('\n' + '='.repeat(80));
-    console.log('MANUAL AUTHORIZATION REQUIRED');
-    console.log('='.repeat(80));
-    console.log('\n1. Open this URL in your browser:');
-    console.log(`   ${authUrl}`);
-    console.log('\n2. Authorize the application');
-    console.log('3. Copy the authorization code from the redirect URL');
-    console.log('   (it will be in the URL parameter "code=...")');
-    console.log('\n' + '='.repeat(80) + '\n');
-
-    const { code } = await inquirer.prompt([
-      {
-        type: 'input',
-        name: 'code',
-        message: 'Enter the authorization code:',
-        validate: (input: string) => {
-          return input.trim().length > 0 || 'Authorization code is required';
-        }
-      }
-    ]);
-
-    return code.trim();
-  }
-
-  /**
-   * Main authentication method
-   */
-  async authenticate(useManualFlow: boolean = false): Promise<WhoopTokens> {
-    logger.agent('AUTH', 'Starting WHOOP API authentication...');
-
-    // Check if we already have valid tokens
-    const existingTokens = this.loadTokens();
-    if (existingTokens && this.isTokenValid(existingTokens)) {
-      logger.success('Valid tokens already exist');
-      return existingTokens;
-    }
-
     try {
-      let authCode: string;
-
-      if (useManualFlow) {
-        authCode = await this.manualAuthFlow();
-      } else {
-        const authUrl = this.generateAuthUrl();
-        console.log(`\nPlease open this URL in your browser to authorize the application:`);
-        console.log(`${authUrl}\n`);
-        
-        authCode = await this.startAuthServer();
-      }
-
-      const tokens = await this.exchangeCodeForTokens(authCode);
-      await this.saveTokens(tokens);
+      const profile = await this.getUserProfile(tokens);
+      const measurements = await this.getBodyMeasurements(tokens);
       
-      logger.success('Authentication completed successfully!');
-      return tokens;
+      this.logger.success('✅ API connection test successful');
+      this.logger.info(`Connected as: ${profile.first_name} ${profile.last_name} (${profile.email})`);
+      this.logger.info(`Height: ${measurements.height_meter}m, Weight: ${measurements.weight_kilogram}kg`);
+      
+      return true;
+    } catch (error) {
+      this.logger.error('❌ API connection test failed');
+      return false;
+    }
+  }
 
+  /**
+   * Revoke tokens (logout)
+   */
+  async revoke(tokens: WhoopTokens): Promise<void> {
+    this.logger.info('🚪 Revoking access tokens...');
+    
+    try {
+      await axios.post(
+        `${this.API_BASE_URL}/oauth/oauth2/revoke`,
+        new URLSearchParams({
+          token: tokens.access_token,
+          client_id: config.whoop.clientId,
+          client_secret: config.whoop.clientSecret
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+        }
+      );
+
+      // Delete local token file
+      try {
+        await fs.unlink(config.tokenFilePath);
+      } catch {}
+
+      this.logger.success('✅ Successfully revoked tokens');
     } catch (error: any) {
-      logger.error(`Authentication failed: ${error.message}`);
+      this.logger.error('❌ Failed to revoke tokens:', error.response?.data || error.message);
       throw error;
     }
   }
-}
 
-// CLI execution
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const agent = new WhoopAuthAgent();
-  
-  // Check for manual flow flag
-  const useManualFlow = process.argv.includes('--manual');
-  
-  agent.authenticate(useManualFlow)
-    .then(() => {
-      logger.success('✅ WHOOP API authentication completed!');
-      process.exit(0);
-    })
-    .catch((error) => {
-      logger.error(`❌ Authentication failed: ${error.message}`);
-      process.exit(1);
-    });
+  /**
+   * BLE Integration Methods
+   */
+
+  /**
+   * Get BLE device pairing information (placeholder for future implementation)
+   */
+  async getBLEPairingInfo(): Promise<{ uuid: string; name: string; characteristics: string[] }> {
+    this.logger.info('📡 Getting BLE device information...');
+    
+    // Based on reverse engineering research
+    return {
+      uuid: 'WHOOP-4.0', // Device name pattern
+      name: 'WHOOP 4.0',
+      characteristics: [
+        '61080002-8d6d-82b8-614a-1c8cb0f8dcc6', // Main data characteristic
+        '61080003-8d6d-82b8-614a-1c8cb0f8dcc6', // Heart rate data
+        '61080004-8d6d-82b8-614a-1c8cb0f8dcc6', // Motion data
+        '61080005-8d6d-82b8-614a-1c8cb0f8dcc6', // Environmental data
+      ]
+    };
+  }
+
+  /**
+   * Check if BLE integration is supported
+   */
+  isBLESupported(): boolean {
+    // Check if we're in a Node.js environment that supports BLE
+    try {
+      require('noble');
+      return true;
+    } catch {
+      this.logger.warn('⚠️ BLE support not available - noble package not installed');
+      return false;
+    }
+  }
+
+  /**
+   * Initialize BLE connection (placeholder for future implementation)
+   */
+  async initializeBLE(): Promise<boolean> {
+    if (!this.isBLESupported()) {
+      return false;
+    }
+
+    this.logger.info('📡 Initializing BLE connection...');
+    
+    // This would be implemented with the BLE agent
+    // For now, return false to indicate BLE is not yet implemented
+    this.logger.warn('⚠️ BLE integration coming in future iteration');
+    return false;
+  }
+
+  /**
+   * Get current authentication status
+   */
+  async getAuthStatus(): Promise<{
+    authenticated: boolean;
+    user?: WhoopUser;
+    measurements?: BodyMeasurements;
+    tokenExpiry?: string;
+    bleSupported: boolean;
+    bleConnected: boolean;
+  }> {
+    try {
+      const tokens = await this.loadTokens();
+      if (!tokens || !await this.validateTokens(tokens)) {
+        return {
+          authenticated: false,
+          bleSupported: this.isBLESupported(),
+          bleConnected: false
+        };
+      }
+
+      const [user, measurements] = await Promise.all([
+        this.getUserProfile(tokens),
+        this.getBodyMeasurements(tokens)
+      ]);
+
+      return {
+        authenticated: true,
+        user,
+        measurements,
+        tokenExpiry: new Date(tokens.expires_at).toISOString(),
+        bleSupported: this.isBLESupported(),
+        bleConnected: await this.initializeBLE()
+      };
+    } catch (error) {
+      return {
+        authenticated: false,
+        bleSupported: this.isBLESupported(),
+        bleConnected: false
+      };
+    }
+  }
 }
